@@ -95,20 +95,26 @@ class ProxyModel(CNNModel):
         self.sinabs_network = sinabs.from_torch.from_model(self.ann)
         self.snn = self.sinabs_network.spiking_model
 
-        # share same set of params across snn and ann
-        for ((ann_param_name, ann_param), (snn_param_name, snn_param)) in zip(self.ann.named_parameters(), self.snn.named_parameters()):
-            if (ann_param.shape != snn_param.shape):
-                raise Exception(f"Parameter shapes don't match {ann_param.shape}, {snn_param.shape}")
-            snn_param.data = ann_param.data
+        self.share_weights()
 
         # Metrics
         self.train_snn_accuracy = Accuracy()
         self.val_snn_accuracy = Accuracy()
         self.test_snn_accuracy = Accuracy()
 
+    def on_post_move_to_device(self) -> None:
+        self.share_weights()
+
+    def share_weights(self):
+        # NOTE: While ideally this should only be required once, I am having to do this every run.
+        # share same set of params across snn and ann
+        for (param_name, ann_param) in self.ann.named_parameters():
+            self.snn.get_parameter(param_name).data = ann_param.data
+
     @staticmethod
     def compute_loss(out: torch.Tensor, labels: torch.Tensor):
-        loss = F.cross_entropy(out, labels)
+        # loss = F.cross_entropy(out, labels)  # CrossEntropy fails to learn anything meaningful so far.
+        loss = F.mse_loss(out, F.one_hot(labels, 10).float())  # CrossEntropy fails to learn anything meaningful so far.
         return loss
 
     @staticmethod
@@ -119,6 +125,9 @@ class ProxyModel(CNNModel):
         # SNN
         _, pred = torch.max(out_snn.sum(1), dim=-1)
         snn_accuracy(pred, labels)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.ann.parameters(), lr=1e-4, betas=(0.8, 0.99), eps=1e-08, weight_decay=1e-06)
 
     def forward(self, data):
         img, spk = data
@@ -133,6 +142,7 @@ class ProxyModel(CNNModel):
         return out_ann, out_snn
 
     def training_step(self, batch, batch_idx):
+        self.share_weights()
         data, labels = batch
         # Reset snn states
         self.sinabs_network.reset_states()
@@ -146,11 +156,19 @@ class ProxyModel(CNNModel):
 
         # Loss computation
         # Replace ann output with snn output
-        out_ann.data.copy_(out_snn.sum(1))
+        out_ann.data.copy_(out_snn.mean(1))
         loss = self.compute_loss(out_ann, labels)
         self.log("train_loss", loss)
 
+        with torch.no_grad():
+            mean_weight_ann, mean_weight_snn = self.compute_mean_weights()
+            self.log("mean_weight_ann", mean_weight_ann.item())
+            self.log("mean_weight_snn", mean_weight_snn.item())
+
         return loss
+
+    def on_validation_start(self) -> None:
+        self.share_weights()
 
     def validation_step(self, batch, batch_idx):
         data, labels = batch
@@ -166,6 +184,9 @@ class ProxyModel(CNNModel):
         self.log("val_snn_accuracy", self.val_snn_accuracy)
         self.log("val_ann_accuracy", self.val_ann_accuracy)
         return val_loss
+
+    def on_test_start(self) -> None:
+        self.share_weights()
 
     def test_step(self, batch, batch_idx):
         data, labels = batch
@@ -186,3 +207,17 @@ class ProxyModel(CNNModel):
         data, labels = batch
         out_ann, out_snn = self(data)
         return out_ann, out_snn
+
+    def compute_mean_weights(self):
+        param_count = 0
+        sum_all_weights_ann = 0
+        sum_all_weights_snn = 0
+        for p in self.ann.parameters():
+            param_count += p.numel()
+            sum_all_weights_ann += p.abs().sum()
+
+        for p in self.snn.parameters():
+            param_count += p.numel()
+            sum_all_weights_snn += p.abs().sum()
+
+        return sum_all_weights_ann/param_count, sum_all_weights_snn/param_count
