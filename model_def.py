@@ -3,38 +3,38 @@ import sinabs
 import torch.nn as nn
 import torch.nn.functional as F
 import sinabs.layers as sl
+from sinabs.activation import SingleSpike, MembraneReset, MultiSpike, MembraneSubtract
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 
 
 class CNNModel(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05):
         super().__init__()
-        self.bias = False
-        self.n_out = 10
+        self.save_hyperparameters()
         self.ann = nn.Sequential(
-            nn.Conv2d(3, 256, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
+            nn.Conv2d(3, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
             nn.ReLU(),
-            nn.Conv2d(256, 512, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
-            nn.ReLU(),
-            sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
+            nn.Conv2d(256, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
             nn.ReLU(),
             sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
-            nn.Conv2d(512, 256, kernel_size=(3, 3), stride=1, padding=0, bias=self.bias),
+            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+            nn.ReLU(),
+            sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
+            nn.Conv2d(512, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(1024, 1024, bias=self.bias),
+            nn.Linear(1024, 1024, bias=bias),
             nn.ReLU(),
-            nn.Linear(1024, 512, bias=self.bias),
+            nn.Linear(1024, 512, bias=bias),
             nn.ReLU(),
-            nn.Linear(512, 256, bias=self.bias),
+            nn.Linear(512, 256, bias=bias),
             nn.ReLU(),
-            nn.Linear(256, 10, bias=self.bias),
+            nn.Linear(256, n_out, bias=bias),
         )
 
         self.train_ann_accuracy = Accuracy()
@@ -45,7 +45,11 @@ class CNNModel(pl.LightningModule):
         return self.ann(data)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.ann.parameters(), lr=1e-4)
+        return torch.optim.Adam(self.ann.parameters(),
+                                lr=self.hparams.lr,
+                                betas=self.hparams.betas,
+                                eps=self.hparams.eps,
+                                weight_decay=self.hparams.weight_decay)
 
     def training_step(self, batch, batch_idx):
         data, labels = batch
@@ -90,9 +94,16 @@ class CNNModel(pl.LightningModule):
 
 
 class ProxyModel(CNNModel):
-    def __init__(self):
-        super().__init__()
-        self.sinabs_network = sinabs.from_torch.from_model(self.ann)
+    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05, spike_threshold=3.0, spike_fn="SingleSpike", reset_fn="MembraneReset", min_v_mem=-3.0):
+        super().__init__(bias=bias, n_out=n_out, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.save_hyperparameters(ignore=["spike_fn", "reset_fn"])
+
+        self.sinabs_network = sinabs.from_torch.from_model(
+            self.ann,
+            spike_threshold=spike_threshold,
+            spike_fn=self.get_spike_fn(spike_fn),
+            reset_fn=self.get_reset_fn(reset_fn),
+            min_v_mem=min_v_mem)
         self.snn = self.sinabs_network.spiking_model
 
         self.share_weights()
@@ -102,20 +113,34 @@ class ProxyModel(CNNModel):
         self.val_snn_accuracy = Accuracy()
         self.test_snn_accuracy = Accuracy()
 
-    def on_post_move_to_device(self) -> None:
-        self.share_weights()
-
     def share_weights(self):
         # NOTE: While ideally this should only be required once, I am having to do this every run.
         # share same set of params across snn and ann
         for (param_name, ann_param) in self.ann.named_parameters():
             self.snn.get_parameter(param_name).data = ann_param.data
 
-    @staticmethod
-    def compute_loss(out: torch.Tensor, labels: torch.Tensor):
+    def compute_loss(self, out: torch.Tensor, labels: torch.Tensor):
         # loss = F.cross_entropy(out, labels)  # CrossEntropy fails to learn anything meaningful so far.
-        loss = F.mse_loss(out, F.one_hot(labels, 10).float())  # CrossEntropy fails to learn anything meaningful so far.
+        loss = F.mse_loss(out, F.one_hot(labels, self.hparams.n_out).float())
         return loss
+
+    @staticmethod
+    def get_spike_fn(name: str):
+        if name == "SingleSpike":
+            return SingleSpike()
+        elif name == "MultiSpike":
+            return MultiSpike()
+        else:
+            raise Exception("Unknown spike mechanism")
+
+    @staticmethod
+    def get_reset_fn(name: str):
+        if name == "MembraneReset":
+            return MembraneReset()
+        elif name == "MembraneSubtract":
+            return MembraneSubtract()
+        else:
+            raise Exception("Unknown reset mechanism")
 
     @staticmethod
     def compute_accuracies(out_ann: torch.Tensor, out_snn: torch.Tensor, labels: torch.Tensor, ann_accuracy: Accuracy, snn_accuracy: Accuracy):
@@ -126,9 +151,6 @@ class ProxyModel(CNNModel):
         _, pred = torch.max(out_snn.sum(1), dim=-1)
         snn_accuracy(pred, labels)
 
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.ann.parameters(), lr=1e-4, betas=(0.8, 0.99), eps=1e-08, weight_decay=1e-06)
-
     def forward(self, data):
         img, spk = data
         (batch, time, channel, height, width) = spk.shape
@@ -138,7 +160,7 @@ class ProxyModel(CNNModel):
             spk = spk.reshape((-1, channel, height, width))
             out_snn = self.snn(spk)
             # unwrap batch time
-            out_snn = out_snn.reshape((batch, time, self.n_out))
+            out_snn = out_snn.reshape((batch, time, self.hparams.n_out))
         return out_ann, out_snn
 
     def training_step(self, batch, batch_idx):
@@ -160,6 +182,7 @@ class ProxyModel(CNNModel):
         loss = self.compute_loss(out_ann, labels)
         self.log("train_loss", loss)
 
+        # Compute accuracies
         with torch.no_grad():
             mean_weight_ann, mean_weight_snn = self.compute_mean_weights()
             self.log("mean_weight_ann", mean_weight_ann.item())
@@ -176,13 +199,14 @@ class ProxyModel(CNNModel):
         self.sinabs_network.reset_states()
         # Forward pass
         out_ann, out_snn = self(data)
-        val_loss = self.compute_loss(out_snn.sum(1), labels)
+        val_loss = self.compute_loss(out_snn.mean(1), labels)
         self.log("val_loss", val_loss)
 
         # Compute accuracy
-        self.compute_accuracies(out_ann, out_snn, labels, self.val_ann_accuracy, self.val_snn_accuracy)
-        self.log("val_snn_accuracy", self.val_snn_accuracy)
-        self.log("val_ann_accuracy", self.val_ann_accuracy)
+        with torch.no_grad():
+            self.compute_accuracies(out_ann, out_snn, labels, self.val_ann_accuracy, self.val_snn_accuracy)
+            self.log("val_snn_accuracy", self.val_snn_accuracy)
+            self.log("val_ann_accuracy", self.val_ann_accuracy)
         return val_loss
 
     def on_test_start(self) -> None:
@@ -194,13 +218,14 @@ class ProxyModel(CNNModel):
         self.sinabs_network.reset_states()
         # Forward pass
         out_ann, out_snn = self(data)
-        test_loss = self.compute_loss(out_snn.sum(1), labels)
+        test_loss = self.compute_loss(out_snn.mean(1), labels)
         self.log("test_loss", test_loss)
 
         # Compute accuracy
-        self.compute_accuracies(out_ann, out_snn, labels, self.test_ann_accuracy, self.test_snn_accuracy)
-        self.log("test_snn_accuracy", self.test_snn_accuracy)
-        self.log("test_ann_accuracy", self.test_ann_accuracy)
+        with torch.no_grad():
+            self.compute_accuracies(out_ann, out_snn, labels, self.test_ann_accuracy, self.test_snn_accuracy)
+            self.log("test_snn_accuracy", self.test_snn_accuracy)
+            self.log("test_ann_accuracy", self.test_ann_accuracy)
         return test_loss
 
     def predict_step(self, batch, batch_idx, **kwargs):

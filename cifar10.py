@@ -62,7 +62,7 @@ class ProxyCifar10(Cifar10DataModule):
     Cifar data in both image and current over time format
     """
 
-    def __init__(self, batch_size=1, time_steps=50, num_workers=6):
+    def __init__(self, batch_size=1, time_steps=60, num_workers=6):
         super().__init__(batch_size=batch_size, num_workers=num_workers)
         self.time_steps = time_steps
         self.transforms = Compose([ToTensor(), ImageAndCurrent(time_steps=self.time_steps)])
