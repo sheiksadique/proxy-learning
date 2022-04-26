@@ -3,39 +3,67 @@ import sinabs
 import torch.nn as nn
 import torch.nn.functional as F
 import sinabs.layers as sl
-from sinabs.activation import SingleSpike, MembraneReset, MultiSpike, MembraneSubtract
+from sinabs.activation import SingleSpike, MembraneReset, MultiSpike, MembraneSubtract, SingleExponential, PeriodicExponential
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 
 
+def build_cifar10_ann(bias=False):
+    ann = nn.Sequential(
+        nn.Conv2d(3, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        nn.Conv2d(256, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
+        nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
+        nn.Conv2d(512, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
+        nn.ReLU(),
+        nn.Flatten(),
+        nn.Linear(1024, 1024, bias=bias),
+        nn.ReLU(),
+        nn.Linear(1024, 512, bias=bias),
+        nn.ReLU(),
+        nn.Linear(512, 256, bias=bias),
+        nn.ReLU(),
+        nn.Linear(256, 10, bias=bias),
+    )
+    return ann
+
+
+def build_fashion_mnist(bias=False):
+    ann = nn.Sequential(
+        nn.Conv2d(1, 128, kernel_size=3, bias=bias),
+        nn.ReLU(),
+        nn.Conv2d(128, 128, kernel_size=3, bias=bias),
+        nn.ReLU(),
+        sl.SumPool2d(kernel_size=2, stride=2),
+        nn.Conv2d(128, 128, kernel_size=3, bias=bias),
+        nn.ReLU(),
+        sl.SumPool2d(kernel_size=2, stride=2),
+        nn.Flatten(),
+        nn.Linear(3200, 1024, bias=bias),
+        nn.ReLU(),
+        nn.Linear(1024, 256, bias=bias),
+        nn.ReLU(),
+        nn.Linear(256, 10, bias=bias),
+    )
+    return ann
+
+
 class CNNModel(pl.LightningModule):
-    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05):
+    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05, model="cifar10"):
         super().__init__()
         self.save_hyperparameters()
-        self.ann = nn.Sequential(
-            nn.Conv2d(3, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            nn.Conv2d(256, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            sl.SumPool2d(kernel_size=(2, 2), stride=(2, 2)),
-            nn.Conv2d(512, 256, kernel_size=(3, 3), stride=1, padding=0, bias=bias),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(1024, 1024, bias=bias),
-            nn.ReLU(),
-            nn.Linear(1024, 512, bias=bias),
-            nn.ReLU(),
-            nn.Linear(512, 256, bias=bias),
-            nn.ReLU(),
-            nn.Linear(256, n_out, bias=bias),
-        )
+        if model == "cifar10":
+            self.ann = build_cifar10_ann(bias=bias)
+        elif model == "fashion_mnist":
+            self.ann = build_fashion_mnist(bias=bias)
 
         self.train_ann_accuracy = Accuracy()
         self.test_ann_accuracy = Accuracy()
@@ -94,8 +122,8 @@ class CNNModel(pl.LightningModule):
 
 
 class ProxyModel(CNNModel):
-    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05, spike_threshold=3.0, spike_fn="SingleSpike", reset_fn="MembraneReset", min_v_mem=-3.0):
-        super().__init__(bias=bias, n_out=n_out, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    def __init__(self, bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05, spike_threshold=3.0, spike_fn="SingleSpike", reset_fn="MembraneReset", min_v_mem=-3.0, model="cifar10"):
+        super().__init__(bias=bias, n_out=n_out, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, model=model)
         self.save_hyperparameters(ignore=["spike_fn", "reset_fn"])
 
         self.sinabs_network = sinabs.from_torch.from_model(
@@ -103,6 +131,7 @@ class ProxyModel(CNNModel):
             spike_threshold=spike_threshold,
             spike_fn=self.get_spike_fn(spike_fn),
             reset_fn=self.get_reset_fn(reset_fn),
+            surrogate_grad_fn=self.get_surrogate_grad_fn(spike_fn),
             min_v_mem=min_v_mem)
         self.snn = self.sinabs_network.spiking_model
 
@@ -141,6 +170,15 @@ class ProxyModel(CNNModel):
             return MembraneSubtract()
         else:
             raise Exception("Unknown reset mechanism")
+
+    @staticmethod
+    def get_surrogate_grad_fn(spike_fn: str):
+        if spike_fn == "SingleSpike":
+            return SingleExponential()
+        elif spike_fn == "MultiSpike":
+            return PeriodicExponential()
+        else:
+            raise Exception("Unknown gradient function")
 
     @staticmethod
     def compute_accuracies(out_ann: torch.Tensor, out_snn: torch.Tensor, labels: torch.Tensor, ann_accuracy: Accuracy, snn_accuracy: Accuracy):

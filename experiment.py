@@ -1,8 +1,8 @@
 from model_def import CNNModel, ProxyModel
 from cifar10 import Cifar10DataModule, ProxyCifar10
+from fashion_mnist import FashionMNISTDataModule, ProxyFashionMNIST
 import pytorch_lightning as pl
 from pytorch_lightning.loggers.mlflow import MLFlowLogger
-from sinabs.activation import SingleSpike, MembraneReset
 
 
 def train_cnn_only():
@@ -14,9 +14,13 @@ def train_cnn_only():
 
 
 def train_snn_proxy():
-    model = ProxyModel(bias=False, n_out=10, lr=1e-4, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05, spike_threshold=3.0, spike_fn="SingleSpike", reset_fn="MembraneReset", min_v_mem=-3.0)
-    dm = ProxyCifar10(batch_size=16, time_steps=60, num_workers=10)
-    mlf_logger = MLFlowLogger(experiment_name="Proxy Learning", tracking_uri="file:./ml-runs")
+    model = ProxyModel(bias=False, n_out=10,
+                       lr=1e-3, betas=(0.8, 0.99), eps=1e-07, weight_decay=1e-05,
+                       spike_threshold=2.0, spike_fn="MultiSpike", reset_fn="MembraneSubtract",
+                       min_v_mem=-3.0,
+                       model="fashion_mnist")
+    dm = ProxyFashionMNIST(batch_size=16, time_steps=50, num_workers=10)
+    mlf_logger = MLFlowLogger(experiment_name="Proxy Learning FashionMNIST", tracking_uri="file:./ml-runs")
     trainer = pl.Trainer(gpus=1, logger=mlf_logger, max_epochs=15)
     trainer.fit(model, datamodule=dm)
 
